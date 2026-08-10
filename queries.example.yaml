@@ -1,0 +1,87 @@
+# Each entry becomes one MCP tool.
+#
+# The `description` is the most important field: it is what the model reads to
+# decide whether to call the tool. Say when to use it, not just what it does.
+#
+# Only SELECT and WITH ... SELECT are accepted. Arguments are bound as query
+# parameters (%(name)s) — never interpolated into the SQL string.
+
+queries:
+  - name: daily_sales
+    description: >
+      Returns total revenue, order count and units sold for a single day.
+      Use it when the user asks how a specific date performed, or asks about
+      "today" or "yesterday" — resolve those to an exact date first.
+    params:
+      - name: day
+        type: string
+        description: The date to report on, in YYYY-MM-DD format.
+    sql: |
+      SELECT
+        DATE(created_at)            AS day,
+        COUNT(*)                    AS orders,
+        COALESCE(SUM(total), 0)     AS revenue,
+        COALESCE(SUM(quantity), 0)  AS units
+      FROM orders
+      WHERE DATE(created_at) = %(day)s
+      GROUP BY DATE(created_at)
+
+  - name: top_products
+    description: >
+      Returns the best-selling products over a recent window, ordered by
+      revenue. Use it for questions about which products sell most, or where
+      revenue is concentrated.
+    params:
+      - name: days
+        type: integer
+        description: How many days back to look. Defaults to 30.
+        default: 30
+      - name: limit
+        type: integer
+        description: How many products to return. Defaults to 10.
+        default: 10
+    max_rows: 50
+    sql: |
+      SELECT
+        p.sku,
+        p.name,
+        SUM(oi.quantity)          AS units,
+        SUM(oi.quantity * oi.price) AS revenue
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      JOIN orders   o ON o.id = oi.order_id
+      WHERE o.created_at >= NOW() - MAKE_INTERVAL(days => %(days)s)
+      GROUP BY p.sku, p.name
+      ORDER BY revenue DESC
+      LIMIT %(limit)s
+
+  - name: low_stock
+    description: >
+      Returns products whose stock will run out before the supplier can
+      deliver, based on recent sales velocity. Use it for restocking and
+      purchasing questions.
+    params:
+      - name: lead_time_days
+        type: integer
+        description: Days the supplier takes to deliver. Defaults to 30.
+        default: 30
+    sql: |
+      WITH velocity AS (
+        SELECT
+          oi.product_id,
+          SUM(oi.quantity)::numeric / 30 AS units_per_day
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE o.created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY oi.product_id
+      )
+      SELECT
+        p.sku,
+        p.name,
+        p.stock,
+        ROUND(v.units_per_day, 2)                       AS units_per_day,
+        ROUND(p.stock / NULLIF(v.units_per_day, 0), 1)  AS days_of_cover
+      FROM products p
+      JOIN velocity v ON v.product_id = p.id
+      WHERE p.stock < v.units_per_day * %(lead_time_days)s
+      ORDER BY days_of_cover ASC
